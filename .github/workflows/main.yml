@@ -1,0 +1,943 @@
+name: GitCloud
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      machine: ${{ steps.parse.outputs.machine }}
+    steps:
+      - name: Determine Target Machine
+        id: parse
+        env:
+          ENV_CONFIG: ${{ secrets.ENV_CONFIG }}
+          VAR_MACHINE: ${{ vars.MACHINE }}
+        run: |
+          if [ -n "$VAR_MACHINE" ]; then
+            MACHINE=$(echo "$VAR_MACHINE" | tr '[:upper:]' '[:lower:]')
+          else
+            MACHINE=$(python3 -c "
+            import os, json
+            try:
+                cfg = json.loads(os.environ.get('ENV_CONFIG', '{}'))
+                print(cfg.get('MACHINE', 'windows').lower())
+            except:
+                print('windows')
+            " 2>/dev/null || echo "windows")
+          fi
+          echo "machine=$MACHINE" >> "$GITHUB_OUTPUT"
+          echo "Resolved machine type: $MACHINE"
+
+  windows-vm:
+    needs: dispatch
+    if: needs.dispatch.outputs.machine == 'windows'
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Parse ENV_CONFIG Single-Secret
+        shell: powershell
+        env:
+          ENV_CONFIG: ${{ secrets.ENV_CONFIG }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ENV_CONFIG)) { Write-Error "ENV_CONFIG secret is missing or empty!"; exit 1 }
+          $trimmed = $env:ENV_CONFIG.Trim()
+          if ($trimmed.StartsWith("{")) {
+              try {
+                  $config = $trimmed | ConvertFrom-Json -ErrorAction Stop
+                  foreach ($prop in $config.PSObject.Properties) {
+                      $key = $prop.Name
+                      $val = $prop.Value
+                      if ($key -eq "install") {
+                          foreach ($subProp in $val.PSObject.Properties) {
+                              $subKey = "INSTALL_" + $subProp.Name.ToUpper()
+                              $subVal = $subProp.Value.ToString().ToLower()
+                              if ($subVal.Length -gt 4 -and $subVal -ne "true" -and $subVal -ne "false") {
+                                  echo "::add-mask::$subVal"
+                              }
+                              [System.Environment]::SetEnvironmentVariable($subKey, $subVal, "Machine")
+                          }
+                       } else {
+                          $valStr = $val.ToString()
+                          $valLower = $valStr.ToLower()
+                          if ($valLower -ne "true" -and $valLower -ne "false" -and $valStr -notmatch '^\d+$' -and $valStr.Length -ge 3) {
+                              echo "::add-mask::$valStr"
+                          }
+                          [System.Environment]::SetEnvironmentVariable($key, $valStr, "Machine")
+                      }
+                  }
+              } catch {
+                  Write-Error "Failed to parse JSON configuration: $_"
+                  exit 1
+              }
+          } else {
+              $lines = $trimmed -split "\r?\n"
+              foreach ($line in $lines) {
+                  if ([string]::IsNullOrWhiteSpace($line) -or $line.Trim().StartsWith("#")) { continue }
+                  $parts = $line -split "=", 2
+                  if ($parts.Length -eq 2) {
+                      $key = $parts[0].Trim()
+                      $value = $parts[1]
+                      if (($value.Length -ge 2) -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+                          $value = $value.Substring(1, $value.Length - 2)
+                      }
+                      if ([string]::IsNullOrWhiteSpace($value)) { continue }
+                      $valLower = $value.ToLower()
+                      if ($valLower -ne "true" -and $valLower -ne "false" -and $value -notmatch '^\d+$' -and $value.Length -ge 3) {
+                          echo "::add-mask::$value"
+                      }
+                      [System.Environment]::SetEnvironmentVariable($key, $value, "Machine")
+                  }
+              }
+          }
+          
+          # Create env loader script for subsequent steps to prevent GHA log spam
+          'foreach($kv in [Environment]::GetEnvironmentVariables("Machine").GetEnumerator()){[Environment]::SetEnvironmentVariable($kv.Key,$kv.Value)}' | Out-File -FilePath "C:\Load-Env.ps1" -Encoding ASCII
+
+
+      - name: Install & Authenticate Tailscale VPN
+        shell: powershell
+        run: |
+          . C:\Load-Env.ps1
+          
+          Write-Host "::group::Deploying Tailscale VPN"
+          $hostname = $env:WIN_HOSTNAME
+          if ([string]::IsNullOrWhiteSpace($hostname)) { $hostname = $env:WIN_USERNAME }
+          $tailnet = $env:TAILSCALE_TAILNET
+          if ([string]::IsNullOrWhiteSpace($tailnet)) { $tailnet = "-" } 
+          
+          if (-not [string]::IsNullOrWhiteSpace($env:TAILSCALE_API_KEY)) {
+              Write-Host "Tailscale API Key detected. Resolving stray offline nodes ($hostname)..."
+              $headers = @{ "Authorization" = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:TAILSCALE_API_KEY):")) }
+              try {
+                  $devicesUrl = "https://api.tailscale.com/api/v2/tailnet/$tailnet/devices"
+                  $response = Invoke-RestMethod -Uri $devicesUrl -Headers $headers -Method Get
+                  $strayDevices = $response.devices | Where-Object { $_.hostname -eq $hostname }
+                  if ($strayDevices) { 
+                      Write-Host "Found $($strayDevices.Count) stray offline nodes with hostname $hostname. Terminating..."
+                      foreach ($dev in $strayDevices) { 
+                          Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($dev.id)" -Headers $headers -Method Delete | Out-Null
+                          Write-Host "Orphaned node $($dev.id) successfully terminated." 
+                      } 
+                  }
+              } catch { 
+                  Write-Host "Warning: Tailscale API resolution failed. Details: $_. Continuing..." 
+              }
+          }
+          
+          Write-Host "Downloading Tailscale installer..."
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "$env:TEMP\tailscale.exe"
+          Write-Host "Running Tailscale installation in quiet mode..."
+          $process = Start-Process -FilePath "$env:TEMP\tailscale.exe" -ArgumentList "/quiet" -Wait -PassThru
+          Write-Host "Installer completed with exit code: $($process.ExitCode)"
+          
+          Write-Host "Initializing Tailscale interface authentication..."
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="$hostname"
+          
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 24) {
+              $raw = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4)
+              if (-not [string]::IsNullOrWhiteSpace($raw) -and $raw -match "^100\.") {
+                  $tsIP = $raw.Trim()
+              } else {
+                  Write-Host "Retry $($retries + 1)/24: IP not active yet. Sleeping 5s..."
+                  Start-Sleep -Seconds 5
+                  $retries++
+              }
+          }
+          
+          if (-not $tsIP) { 
+              Write-Error "CRITICAL: Tailscale routing failed to retrieve a valid 100.x.x.x IP within timeout."
+              exit 1 
+          }
+          
+          Write-Host "Tailscale routing initialized successfully. Assigned IP: $tsIP" -ForegroundColor Green
+          [System.Environment]::SetEnvironmentVariable("TAILSCALE_IP", $tsIP, "Machine")
+          Write-Host "::endgroup::"
+
+      - name: Checkout Cloud Repository (Database & Scripts)
+        shell: powershell
+        run: |
+          . C:\Load-Env.ps1
+          Write-Host "Authenticating to Cloud Database..."
+          $repoUrl = "https://$($env:BACKUP_DB_USER):$($env:BACKUP_DB_PAT)@github.com/$($env:BACKUP_DB_USER)/$($env:BACKUP_DB_REPO).git"
+          
+          $cloneOutput = cmd.exe /c "git clone -q `"$repoUrl`" C:\state-repo 2>&1"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "C:\state-repo\.git")) {
+              Write-Error "CRITICAL: Access to Cloud Repo denied. Check if BACKUP_DB_PAT is expired!"
+              exit 1 
+          }
+          Write-Host "Cloud Repo connection established." -ForegroundColor Green
+          icacls "C:\state-repo" /grant "Everyone:(OI)(CI)F" /T | Out-Null
+          
+          # Clean up any residual lifecycle and sync flags from previous sessions
+          if (Test-Path "C:\state-repo\end_run.flag") {
+              Remove-Item "C:\state-repo\end_run.flag" -Force -ErrorAction SilentlyContinue
+              Write-Host "Wiped residual end_run.flag from state-repo."
+          }
+          if (Test-Path "C:\state-repo\sync.lock") {
+              Remove-Item "C:\state-repo\sync.lock" -Force -ErrorAction SilentlyContinue
+              Write-Host "Wiped residual sync.lock from state-repo."
+          }
+          if (Test-Path "C:\state-repo\idle_disabled.flag") {
+              Remove-Item "C:\state-repo\idle_disabled.flag" -Force -ErrorAction SilentlyContinue
+              Write-Host "Wiped residual idle_disabled.flag from state-repo."
+          }
+          
+          # Force untrack in git so next backup purges them from remote if they were accidentally committed
+          git -C C:\state-repo rm --cached end_run.flag sync.lock idle_disabled.flag --ignore-unmatch 2>&1 | Out-Null
+
+      - name: Provision Local Administrator Account
+        shell: powershell
+        run: |
+          . C:\Load-Env.ps1
+          $securePass = ConvertTo-SecureString "$env:WIN_PASSWORD" -AsPlainText -Force
+          New-LocalUser -Name "$env:WIN_USERNAME" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "$env:WIN_USERNAME"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "$env:WIN_USERNAME"
+
+
+      - name: Initialize Logon Hooks & Background Daemons
+        shell: powershell
+        run: |
+          . C:\Load-Env.ps1
+          $logonScript = @(
+              '$initDir = "C:\state-repo\Windows\Repository\Initialized"',
+              '$bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString("yyyyMMdd-HHmm")',
+              '$runFlag = "C:\state-repo\init_ran_$bootTime.flag"',
+              '$logFile = "C:\state-repo\Logs\Setup.log"',
+              'if (-not (Test-Path "C:\state-repo\Logs")) { New-Item -ItemType Directory -Path "C:\state-repo\Logs" -Force | Out-Null }',
+              'function Write-SetupLog { param([string]$msg); $ts = Get-Date -Format "HH:mm:ss"; Write-Host "[$ts] $msg"; "[$ts] $msg" | Out-File -FilePath $logFile -Append -Encoding UTF8 }',
+              'if ((Test-Path $initDir) -and -not (Test-Path $runFlag)) {',
+              '    Write-SetupLog "--- INITIALIZATION SCRIPTS STARTED ---"',
+              '    $scripts = @(Get-ChildItem -Path $initDir -Filter "*.ps1" | Sort-Object Name)',
+              '    $total = $scripts.Count',
+              '    $current = 0',
+              '    foreach ($script in $scripts) {',
+              '        $current++',
+              '        $runScript = $true',
+              '        if ($script.Name -match "(?i)(?:^|\d+-)?Install-([A-Za-z0-9_-]+)\.ps1$") {',
+              '            $appName = $Matches[1].ToLower()',
+              '            $envVarName = "INSTALL_" + $appName.ToUpper()',
+              '            $toggleVal = [System.Environment]::GetEnvironmentVariable($envVarName, "Machine")',
+              '            if ($toggleVal -ne "true") {',
+              '                Write-SetupLog "[Init] [$current/$total] SKIPPED: $($script.Name)"',
+              '                $runScript = $false',
+              '            }',
+              '        }',
+              '        if ($runScript) {',
+              '            Write-SetupLog "[Init] [$current/$total] RUNNING: $($script.Name)"',
+              '            if ($script.Name -eq "00-StateRestore.ps1") {',
+              '                $p = Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($script.FullName)`"" -Wait -PassThru',
+              '                Write-SetupLog "[Init] [$current/$total] DONE: $($script.Name) (ExitCode: $($p.ExitCode))"',
+              '            } else {',
+              '                Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($script.FullName)`""',
+              '                Write-SetupLog "[Init] [$current/$total] LAUNCHED ASYNC: $($script.Name)"',
+              '            }',
+              '        }',
+              '    }',
+              '    Write-SetupLog "--- INITIALIZATION SCRIPTS FINISHED ---"',
+              '    New-Item -Path $runFlag -ItemType File -Force | Out-Null',
+              '}'
+          )
+          $logonScript | Out-File -FilePath "C:\state-repo\Run-InitScripts.ps1" -Encoding UTF8
+          
+          # Register Scheduled Task to trigger immediately on logon of the RDP user
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File C:\state-repo\Run-InitScripts.ps1"
+          $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:WIN_USERNAME"
+          $principal = New-ScheduledTaskPrincipal -UserId "$env:WIN_USERNAME" -RunLevel Highest
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+          Register-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -TaskName "RDPLogonInit" -Force
+
+      - name: Execute Privileged Provisioning Scripts
+        shell: powershell
+        run: |
+          . C:\Load-Env.ps1
+          $privilegedDir = "C:\state-repo\Windows\Repository\Privileged"
+          if (Test-Path $privilegedDir) {
+              $scripts = @(Get-ChildItem -Path $privilegedDir -Filter "*.ps1" | Sort-Object Name)
+              $total = $scripts.Count
+              $current = 0
+              foreach ($script in $scripts) {
+                  $current++
+                  $runScript = $true
+                  if ($script.Name -match "(?i)(?:^|\d+-)?Install-([A-Za-z0-9_-]+)\.ps1$") {
+                      $appName = $Matches[1].ToLower()
+                      $envVarName = "INSTALL_" + $appName.ToUpper()
+                      $toggleVal = [System.Environment]::GetEnvironmentVariable($envVarName, "Machine")
+                      if ($toggleVal -ne "true") {
+                          Write-Host "[Privileged] [$current/$total] SKIPPED: $($script.Name) (disabled in config)"
+                          $runScript = $false
+                      }
+                  }
+                  if ($runScript) {
+                      Write-Host "::group::[Privileged] [$current/$total] RUNNING: $($script.Name)"
+                      
+                      try {
+                          & powershell.exe -ExecutionPolicy Bypass -NoProfile -File $script.FullName
+                      } catch {
+                          Write-Error "Error executing $($script.Name): $_"
+                      }
+                      
+                      Write-Host "[Privileged] [$current/$total] DONE: $($script.Name)"
+                      Write-Host "::endgroup::"
+                  }
+              }
+          } else {
+              Write-Warning "Privileged scripts directory not found."
+          }
+
+
+
+      - name: Execute Interactive Runtime & Telemetry Stream
+        shell: powershell
+        run: |
+          . C:\Load-Env.ps1
+          try {
+              Write-Host "================ SECURE VPN ENTRY ================"
+              Write-Host "Routing IP : $env:TAILSCALE_IP"
+              Write-Host "Identifier : $env:WIN_USERNAME"
+              Write-Host "=================================================="
+              Write-Host "System diagnostics will stream securely upon connection..."
+          
+          $logDir = "C:\state-repo\Logs"
+          $logPositions = @{}
+          $endTime = (Get-Date).AddMinutes(350)
+          
+          $saveRuntimeEnabled = "$env:SAVE_RUNTIME" -eq "true"
+          
+          $timeoutStr = $env:IDLE_TIMEOUT_MIN
+          if ([string]::IsNullOrWhiteSpace($timeoutStr)) { $timeoutStr = "3" }
+          $idleTimeoutSeconds = [int]$timeoutStr * 60
+          
+          $startTime = Get-Date
+          $isLoggedIn = $false
+          
+          # Pre-seed log positions to current EOF of every existing log file.
+          # This prevents historical log content (from previous sessions persisted in git)
+          # from being replayed into this session's GHA output.
+          if (Test-Path $logDir) {
+              Get-ChildItem -Path $logDir -Filter "*.log" | ForEach-Object {
+                  $logPositions[$_.Name] = $_.Length
+                  Write-Host "[TELEMETRY] Skipping $($_.Length) bytes of historical log in $($_.Name)"
+              }
+          }
+          Write-Host "[TELEMETRY] Log baseline captured. Only live output from this session will be streamed."
+          
+          $wsPath = "C:\state-repo\Windows\Repository\WorkSpace"
+          $literalMaskFilters = @{}
+          
+          while ((Get-Date) -lt $endTime) {
+              # Scan/refresh telemetry blocklists and filters dynamically
+              $telemetryBlocklist = @{}
+              $hideFilters = @{}
+              $maskFilters = @{}
+              $showOnlyFilters = @{}
+              $telemetryDisplayNames = @{}
+              
+              $searchPaths = @()
+              if (Test-Path $wsPath) {
+                  $searchPaths += Get-ChildItem -Path $wsPath -Directory
+              }
+              $frameworkPaths = @("C:\state-repo\Windows\Repository\Privileged", "C:\state-repo\Windows\Repository\Initialized", "C:\state-repo\Windows\Repository\Essentials")
+              foreach ($fp in $frameworkPaths) {
+                  if (Test-Path $fp) {
+                      $searchPaths += [PSCustomObject]@{
+                          FullName = $fp
+                          Name = Split-Path $fp -Leaf
+                      }
+                  }
+              }
+              
+              $searchPaths | ForEach-Object {
+                  $projDir = $_.FullName
+                  $projName = $_.Name
+                  
+                  # Resolve pseudo name if exists
+                  $displayName = $projName
+                  $pseudoFile = Get-ChildItem -Path $projDir -Filter "*.pseudo" | Select-Object -First 1
+                  if ($pseudoFile) {
+                      $displayName = $pseudoFile.BaseName
+                  }
+                  
+                  $logNames = @()
+                  if (Test-Path $logDir) {
+                      Get-ChildItem -Path $logDir -Filter "$projName*.log" | ForEach-Object {
+                          if ($_.Name -eq "$projName.log" -or $_.Name.StartsWith("$projName-")) {
+                              $logNames += $_.Name
+                              $suffix = $_.Name.Substring($projName.Length)
+                              if ($displayName -eq "Clean") {
+                                  $telemetryDisplayNames[$_.Name] = "$projName$suffix"
+                              } else {
+                                  $telemetryDisplayNames[$_.Name] = "$displayName$suffix"
+                              }
+                          }
+                      }
+                  }
+                  
+                  # Read explicitly owned custom log files from telemetry_logs.txt
+                  $customLogListFile = Join-Path $projDir "telemetry_logs.txt"
+                  if (Test-Path $customLogListFile) {
+                      Get-Content $customLogListFile | ForEach-Object {
+                          $l = $_.Trim()
+                          if (-not [string]::IsNullOrWhiteSpace($l) -and -not $l.StartsWith("#") -and $l.EndsWith(".log")) {
+                              if (-not $logNames.Contains($l)) {
+                                  $logNames += $l
+                                  # For external logs, prefix the display name with the project alias
+                                  if ($displayName -eq "Clean") {
+                                      $telemetryDisplayNames[$l] = $l
+                                  } else {
+                                      $telemetryDisplayNames[$l] = "$displayName-$l"
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  if ($logNames.Count -eq 0) {
+                      $logNames = @("$projName.log", "$projName-Error.log")
+                      if ($displayName -eq "Clean") {
+                          $telemetryDisplayNames["$projName.log"] = "$projName.log"
+                          $telemetryDisplayNames["$projName-Error.log"] = "$projName-Error.log"
+                      } else {
+                          $telemetryDisplayNames["$projName.log"] = "$displayName.log"
+                          $telemetryDisplayNames["$projName-Error.log"] = "$displayName-Error.log"
+                      }
+                  }
+                      
+                  # Check for Telemetry.false
+                  if (Test-Path (Join-Path $projDir "Telemetry.false")) {
+                      foreach ($ln in $logNames) {
+                          $telemetryBlocklist[$ln] = $true
+                      }
+                  }
+                  
+                  # Check for telemetry_filters.txt
+                  $filterFile = Join-Path $projDir "telemetry_filters.txt"
+                  if (Test-Path $filterFile) {
+                      $hides = [System.Collections.Generic.List[string]]::new()
+                      $masks = [System.Collections.Generic.List[string]]::new()
+                      $showOnlys = [System.Collections.Generic.List[string]]::new()
+                      
+                      Get-Content $filterFile | ForEach-Object {
+                          $l = $_.Trim()
+                          if ([string]::IsNullOrWhiteSpace($l) -or $l.StartsWith("#")) { return }
+                          if ($l -match "^hide:(.+)$") {
+                              $hides.Add($Matches[1].Trim())
+                          } elseif ($l -match "^mask:(.+)$") {
+                              $masks.Add($Matches[1].Trim())
+                          } elseif ($l -match "^show-only:(.+)$") {
+                              $showOnlys.Add($Matches[1].Trim())
+                          }
+                      }
+                      
+                      foreach ($ln in $logNames) {
+                          if ($hides.Count -gt 0) { $hideFilters[$ln] = $hides }
+                          if ($masks.Count -gt 0) { $maskFilters[$ln] = $masks }
+                          if ($showOnlys.Count -gt 0) { $showOnlyFilters[$ln] = $showOnlys }
+                      }
+                  }
+              }
+
+              if ($saveRuntimeEnabled -and -not $isLoggedIn) {
+                  $qwinsta = qwinsta 2>&1 | Out-String
+                  if ($qwinsta -match "rdp-tcp#.*Active") {
+                      $isLoggedIn = $true
+                      Write-Host "`n[SUCCESS] RDP Connection established. Handing over idle monitoring to interactive daemon..." -ForegroundColor Green
+                  } elseif (((Get-Date) - $startTime).TotalSeconds -gt $idleTimeoutSeconds) {
+                      Write-Host "`n[ALERT] Pre-Login Timeout Reached! No RDP connection was established within $timeoutStr minutes." -ForegroundColor Yellow
+                      Write-Host "::notice::Workflow completion triggered by Idle Timeout (Pre-Login)."
+                      break
+                  }
+              }
+              
+              if (Test-Path "C:\state-repo\end_run.flag") {
+                  Write-Host "`n[ALERT] Shutdown signal (end_run.flag) detected! Gracefully finishing workflow..." -ForegroundColor Yellow
+                  Write-Host "::notice::Workflow completion triggered by manual Finish-Session or User Idle Timeout."
+                  break
+              }
+              
+              if (Test-Path $logDir) {
+                  Get-ChildItem -Path $logDir -Filter "*.log" | ForEach-Object {
+                      $filePath = $_.FullName
+                      $fileName = $_.Name
+                      if (-not $logPositions.ContainsKey($fileName)) { $logPositions[$fileName] = $_.Length }
+                      $lastPos = $logPositions[$fileName]
+                      
+                      $file = Get-Item $filePath
+                      if ($file.Length -gt $lastPos) {
+                          $fs = [System.IO.FileStream]::new($filePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                          $fs.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
+                          $reader = [System.IO.StreamReader]::new($fs)
+                          while (-not $reader.EndOfStream) { 
+                              $line = $reader.ReadLine()
+                              
+                              # Process dynamic <MASK>...</MASK>
+                              if ($line -match "<MASK>(.*?)</MASK>") {
+                                  $regexMatches = [regex]::Matches($line, "(?i)<MASK>(.*?)</MASK>")
+                                  foreach ($m in $regexMatches) {
+                                      $secret = $m.Groups[1].Value
+                                      if (-not [string]::IsNullOrWhiteSpace($secret)) {
+                                          if (-not $literalMaskFilters.ContainsKey($fileName)) {
+                                              $literalMaskFilters[$fileName] = [System.Collections.Generic.List[string]]::new()
+                                          }
+                                          if (-not $literalMaskFilters[$fileName].Contains($secret)) {
+                                              $literalMaskFilters[$fileName].Add($secret)
+                                          }
+                                      }
+                                  }
+                                  $line = [regex]::Replace($line, "(?i)<MASK>.*?</MASK>", "***")
+                              }
+                              
+                              # Skip if the log is in the telemetry blocklist
+                              if ($telemetryBlocklist.ContainsKey($fileName)) {
+                                  continue
+                              }
+                              
+                              # Check if we should only show specific lines
+                              if ($showOnlyFilters.ContainsKey($fileName)) {
+                                  $matchedShow = $false
+                                  foreach ($pattern in $showOnlyFilters[$fileName]) {
+                                      if ($line -match $pattern) {
+                                          $matchedShow = $true
+                                          break
+                                      }
+                                  }
+                                  if (-not $matchedShow) { continue }
+                              }
+                              
+                              # Check if the line matches any hide filters
+                              $skipLine = $false
+                              if ($hideFilters.ContainsKey($fileName)) {
+                                  foreach ($pattern in $hideFilters[$fileName]) {
+                                      if ($line -match $pattern) {
+                                          $skipLine = $true
+                                          break
+                                      }
+                                  }
+                              }
+                              if ($skipLine) { continue }
+                              
+                              # Apply mask filters
+                              if ($maskFilters.ContainsKey($fileName)) {
+                                  foreach ($pattern in $maskFilters[$fileName]) {
+                                      $line = $line -replace $pattern, '***'
+                                  }
+                              }
+                              
+                              # Apply literal mask filters
+                              if ($literalMaskFilters.ContainsKey($fileName)) {
+                                  foreach ($secret in $literalMaskFilters[$fileName]) {
+                                      $line = $line.Replace($secret, "***")
+                                  }
+                              }
+                              
+                              $printName = if ($telemetryDisplayNames.ContainsKey($fileName)) { $telemetryDisplayNames[$fileName] } else { $fileName }
+                              Write-Host "[$printName] $line" 
+                          }
+                          $logPositions[$fileName] = $fs.Position
+                          $reader.Close()
+                          $fs.Close()
+                      }
+                  }
+              }
+              Start-Sleep -Seconds 5
+          }
+          } finally {
+              Write-Host "`n[TELEMETRY] Stream terminated gracefully. Flushing resources..." -ForegroundColor Cyan
+          }
+
+
+      - name: Finalize Session Persistence & State Synchronization
+        if: always()
+        shell: powershell
+        run: |
+          . C:\Load-Env.ps1
+          Write-Host "=== INITIATING EMERGENCY TEARDOWN ==="
+          $stateRepo = 'C:\state-repo'
+          if (-not (Test-Path $stateRepo)) { exit 0 }
+          
+          if (-not (Test-Path "$stateRepo\end_run.flag")) {
+              Write-Host "Broadcasting end_run.flag to workspace projects for graceful shutdown..."
+              New-Item -Path "$stateRepo\end_run.flag" -ItemType File -Force | Out-Null
+          }
+          Write-Host "Waiting 30 seconds for gracefully exiting processes..."
+          Start-Sleep -Seconds 30
+          
+          if (Test-Path "$stateRepo\Windows\Repository\Essentials\Force-Backup.ps1") {
+              Write-Host "Executing Final Backup..."
+              & "$stateRepo\Windows\Repository\Essentials\Force-Backup.ps1"
+          }
+
+          # Kill lingering background processes spawned by the RDP session
+          # (sync daemon, idle monitor, project runners) so the GHA runner can exit cleanly.
+          # NOTE: We do NOT call 'logoff' here — logoff terminates the Windows session that
+          #       owns the GHA runner process tree, causing the workflow to hang without
+          #       ever reporting completion to GitHub.
+          Write-Host "Cleaning up lingering background processes..."
+          $targetUser = $env:WIN_USERNAME
+          if (-not [string]::IsNullOrWhiteSpace($targetUser)) {
+              Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
+                  Where-Object { $_.UserName -like "*$targetUser*" } |
+                  Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "Teardown complete."
+
+  linux-vm:
+    needs: dispatch
+    if: needs.dispatch.outputs.machine == 'linux'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Parse ENV_CONFIG
+        id: parse_env
+        env:
+          ENV_CONFIG: ${{ secrets.ENV_CONFIG }}
+        run: |
+          # Parse JSON and output to temporary files, printing masks to stderr
+          # We read ENV_CONFIG directly from the process environment in Python to prevent shell command execution leaks
+          python3 -c '
+          import os, sys, json
+
+          env_config = os.environ.get("ENV_CONFIG")
+          if not env_config or not env_config.strip():
+              print("ENV_CONFIG secret is missing or empty!", file=sys.stderr)
+              sys.exit(1)
+
+          try:
+              cfg = json.loads(env_config)
+          except Exception as e:
+              print(f"Failed to parse JSON: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          sensitive_keys = {
+              "BACKUP_DB_PAT", "TAILSCALE_API_KEY", "TAILSCALE_AUTH_KEY",
+              "CF_TUNNEL_TOKEN", "LIN_PASSWORD", "WIN_PASSWORD"
+          }
+
+          with open("/tmp/env_configs.public", "w") as f_pub, open("/tmp/env_configs.private", "w") as f_priv:
+              for key, val in cfg.items():
+                  if key == "install":
+                      for sub_key, sub_val in val.items():
+                          env_key = f"INSTALL_{sub_key.upper()}"
+                          env_val = str(sub_val).lower()
+                          if len(env_val) > 4 and env_val not in ["true", "false"]:
+                              print(f"::add-mask::{env_val}", file=sys.stderr)
+                          f_pub.write(f"{env_key}={env_val}\n")
+                  else:
+                      env_val = str(val)
+                      val_lower = env_val.lower()
+                      if val_lower not in ["true", "false"] and not env_val.isdigit() and len(env_val) >= 3 and key != "MACHINE":
+                          print(f"::add-mask::{env_val}", file=sys.stderr)
+                      
+                      if key in sensitive_keys:
+                          f_priv.write(f"{key}={env_val}\n")
+                      else:
+                          f_pub.write(f"{key}={env_val}\n")
+          '
+
+          # Export both to GITHUB_ENV
+          cat /tmp/env_configs.public >> $GITHUB_ENV
+          cat /tmp/env_configs.private >> $GITHUB_ENV
+
+          # Append public configs to /etc/environment
+          sudo tee -a /etc/environment < /tmp/env_configs.public > /dev/null
+
+          # Write private configs to /etc/gitcloud.env with restricted permissions (root-only)
+          sudo touch /etc/gitcloud.env
+          sudo chmod 600 /etc/gitcloud.env
+          sudo tee /etc/gitcloud.env < /tmp/env_configs.private > /dev/null
+
+          # Clean up temporary files to prevent leaks
+          rm -f /tmp/env_configs.public /tmp/env_configs.private
+
+
+      - name: Install & Authenticate Tailscale VPN
+        run: |
+          echo "Installing Tailscale..."
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          # Delete any stale nodes with the same hostname to prevent routing collisions
+          if [ -n "$TAILSCALE_API_KEY" ]; then
+              TARGET_HOST="${LIN_HOSTNAME:-$LIN_USERNAME}"
+              echo "Cleaning up orphaned Tailscale nodes matching $TARGET_HOST..."
+              DEVICES=$(curl -s -u "$TAILSCALE_API_KEY:" "https://api.tailscale.com/api/v2/tailnet/$TAILSCALE_TAILNET/devices")
+              DEVICE_ID=$(echo "$DEVICES" | TARGET_HOST="$TARGET_HOST" python3 -c "
+          import sys, json, os
+          try:
+              data = json.load(sys.stdin)
+              target = os.environ.get('TARGET_HOST', '').lower()
+              if target:
+                  for d in data.get('devices', []):
+                      if target in d.get('name', '').lower() or target in d.get('hostname', '').lower():
+                          print(d.get('id', ''))
+                          break
+          except:
+              pass
+              ")
+              if [ -n "$DEVICE_ID" ]; then
+                  echo "Found orphaned node $DEVICE_ID. Deleting..."
+                  curl -s -X DELETE -u "$TAILSCALE_API_KEY:" "https://api.tailscale.com/api/v2/device/$DEVICE_ID"
+              fi
+          fi
+          
+          echo "Authenticating node..."
+          TS_HOSTNAME="${LIN_HOSTNAME:-$LIN_USERNAME}"
+          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME" --ssh
+          
+          echo "Waiting for IP assignment..."
+          for i in {1..12}; do
+              TS_IP=$(tailscale ip -4 2>/dev/null)
+              if [[ "$TS_IP" == 100.* ]]; then
+                  echo "Tailscale IP assigned: $TS_IP"
+                  echo "TAILSCALE_IP=$TS_IP" | sudo tee -a /etc/environment > /dev/null
+                  echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+                  break
+              fi
+              echo "IP not yet assigned. Waiting..."
+              sleep 5
+          done
+
+      - name: Checkout Cloud Repository
+        run: |
+          sudo mkdir -p /opt/state-repo
+          sudo chown -R $USER:$USER /opt/state-repo
+          
+          # We check out the cloud DB containing both Windows/ and Linux/ directories
+          REPO_URL="https://${BACKUP_DB_USER}:${BACKUP_DB_PAT}@github.com/${BACKUP_DB_USER}/${BACKUP_DB_REPO}.git"
+          git clone -q "$REPO_URL" /opt/state-repo
+          
+          if [ ! -d "/opt/state-repo/.git" ]; then
+              echo "CRITICAL: Access to Cloud Repo denied."
+              exit 1
+          fi
+          
+          sudo chmod -R 777 /opt/state-repo
+          rm -f "/opt/state-repo/end_run.flag" "/opt/state-repo/sync.lock" "/opt/state-repo/idle_disabled.flag"
+          git -C /opt/state-repo rm --cached end_run.flag sync.lock idle_disabled.flag --ignore-unmatch >/dev/null 2>&1
+
+      - name: Provision SSH User & Link Workspace
+        run: |
+          echo "Creating SSH user $LIN_USERNAME..."
+          if ! id -u "$LIN_USERNAME" >/dev/null 2>&1; then
+              sudo useradd -m -s /bin/bash "$LIN_USERNAME"
+          fi
+          echo "$LIN_USERNAME:$LIN_PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo "$LIN_USERNAME"
+          
+          # Create symbolic links directly in user home folder for easy SSH/SFTP access
+          sudo -u "$LIN_USERNAME" ln -sfn /opt/state-repo/Linux/Repository/WorkSpace "/home/$LIN_USERNAME/WorkSpace"
+          sudo -u "$LIN_USERNAME" ln -sfn /opt/state-repo/Logs "/home/$LIN_USERNAME/Logs"
+          sudo -u "$LIN_USERNAME" ln -sfn /opt/state-repo "/home/$LIN_USERNAME/state-repo"
+          
+          # Ensure Essentials scripts are executable and link them directly to user home
+          sudo chmod +x /opt/state-repo/Linux/Repository/Essentials/*.sh 2>/dev/null || true
+          sudo -u "$LIN_USERNAME" ln -sfn /opt/state-repo/Linux/Repository/Essentials/Finish-Session.sh "/home/$LIN_USERNAME/Finish-Session.sh"
+          sudo -u "$LIN_USERNAME" ln -sfn /opt/state-repo/Linux/Repository/Essentials/Force-Backup.sh "/home/$LIN_USERNAME/Force-Backup.sh"
+          sudo -u "$LIN_USERNAME" ln -sfn /opt/state-repo/Linux/Repository/Essentials/Force-Restore.sh "/home/$LIN_USERNAME/Force-Restore.sh"
+          sudo -u "$LIN_USERNAME" ln -sfn /opt/state-repo/Linux/Repository/Essentials/Toggle-AutoShutdown.sh "/home/$LIN_USERNAME/Toggle-AutoShutdown.sh"
+          
+          # Set up bash profile to source environment variables
+          echo 'source /etc/environment' | sudo tee -a "/home/$LIN_USERNAME/.bashrc" >/dev/null
+
+
+      - name: Configure SSH & SFTP Server
+        run: |
+          echo "Ensuring SSH and Mosh servers are installed..."
+          sudo apt-get update && sudo apt-get install -y openssh-server mosh
+          
+          # Enable password authentication (required for SFTP without keys)
+          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          
+          # Create override conf to bypass any cloud-init settings (e.g. 50-cloud-init.conf)
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          echo "PasswordAuthentication yes" | sudo tee /etc/ssh/sshd_config.d/99-custom-password-auth.conf > /dev/null
+          echo "UseDNS no" | sudo tee -a /etc/ssh/sshd_config.d/99-custom-password-auth.conf > /dev/null
+          echo "GSSAPIAuthentication no" | sudo tee -a /etc/ssh/sshd_config.d/99-custom-password-auth.conf > /dev/null
+          
+          # Enable ClientAlive intervals for idle detection
+          sudo sed -i 's/^#ClientAliveInterval.*/ClientAliveInterval 60/' /etc/ssh/sshd_config
+          
+          # Enable ClientAliveCountMax
+          sudo sed -i 's/^#ClientAliveCountMax.*/ClientAliveCountMax 3/' /etc/ssh/sshd_config
+          
+          if [ -n "$SSH_HOST_ED25519_KEY_B64" ]; then
+              echo "Injecting persistent SSH host fingerprint..."
+              echo "$SSH_HOST_ED25519_KEY_B64" | base64 -d | sudo tee /etc/ssh/ssh_host_ed25519_key > /dev/null
+              sudo chmod 600 /etc/ssh/ssh_host_ed25519_key
+              sudo ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key | sudo tee /etc/ssh/ssh_host_ed25519_key.pub > /dev/null
+              sudo chmod 644 /etc/ssh/ssh_host_ed25519_key.pub
+          fi
+          
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh.socket ssh 2>/dev/null || sudo systemctl restart ssh
+
+      - name: Execute Privileged Provisioning Scripts
+        run: |
+          source /etc/environment
+          PRIV_DIR="/opt/state-repo/Linux/Repository/Privileged"
+          
+          if [ -d "$PRIV_DIR" ]; then
+              for script in $(ls "$PRIV_DIR"/*.sh 2>/dev/null | sort); do
+                  script_name=$(basename "$script")
+                  run_script=true
+                  
+                  # Check if it's an installer script that respects toggles
+                  if [[ "$script_name" =~ ^([0-9]+-)?Install-([a-zA-Z0-9_-]+)\.sh$ ]]; then
+                      app_name="${BASH_REMATCH[2],,}" # lowercase
+                      env_var="INSTALL_${app_name^^}" # uppercase
+                      toggle_val="${!env_var}"
+                      
+                      if [ "$toggle_val" != "true" ]; then
+                          echo "Skipping Privileged Installer: $script_name"
+                          run_script=false
+                      fi
+                  fi
+                  
+                  if [ "$run_script" = true ]; then
+                      echo "::group::Executing Privileged Script: $script_name"
+                      sudo -E bash "$script"
+                      echo "::endgroup::"
+                  fi
+              done
+          else
+              echo "Privileged scripts directory not found at $PRIV_DIR"
+          fi
+
+      - name: Execute Interactive Runtime & Telemetry Stream
+        run: |
+          source /etc/environment
+          echo "================ SECURE SSH ENTRY ================"
+          echo "Routing IP : $TAILSCALE_IP"
+          echo "Identifier : $LIN_USERNAME"
+          echo "=================================================="
+          echo "System diagnostics will stream securely upon connection..."
+          
+          LOG_DIR="/opt/state-repo/Logs"
+          mkdir -p "$LOG_DIR"
+          
+          # 350 minute soft timeout
+          END_TIME=$(date -d "+350 minutes" +%s)
+          
+          declare -A LOG_POSITIONS
+          
+          # Pre-seed offsets to skip historical logs
+          for log in "$LOG_DIR"/*.log; do
+              if [ -f "$log" ]; then
+                  LOG_POSITIONS["$(basename "$log")"]=$(wc -c < "$log")
+              fi
+          done
+          
+          declare -A HIDE_FILTERS
+          declare -A MASK_FILTERS
+          declare -A SHOW_ONLY_FILTERS
+          declare -A TELEMETRY_NAMES
+          declare -A LITERAL_MASKS
+          
+          while [ $(date +%s) -lt $END_TIME ]; do
+              if [ -f "/opt/state-repo/end_run.flag" ]; then
+                  echo "End run flag detected. Breaking telemetry loop."
+                  break
+              fi
+              
+              # Fast polling telemetry (bash equivalent of the C# FileStream loop)
+              for log in "$LOG_DIR"/*.log; do
+                  if [ ! -f "$log" ]; then continue; fi
+                  file_name=$(basename "$log")
+                  
+                  if [ -z "${LOG_POSITIONS[$file_name]}" ]; then
+                      LOG_POSITIONS[$file_name]=0
+                  fi
+                  
+                  last_pos=${LOG_POSITIONS[$file_name]}
+                  current_size=$(wc -c < "$log")
+                  
+                  if [ "$current_size" -gt "$last_pos" ]; then
+                      # Determine project prefix
+                      project_prefix=$(echo "$file_name" | cut -d'-' -f1)
+                      project_prefix=${project_prefix%.*}
+                      workspace_dir="/opt/state-repo/Linux/Repository/WorkSpace/$project_prefix"
+                      
+                      if [ -f "$workspace_dir/Telemetry.false" ]; then
+                          LOG_POSITIONS[$file_name]=$current_size
+                          continue
+                      fi
+                      
+                      # Check pseudo name
+                      print_name="$file_name"
+                      if [ -d "$workspace_dir" ]; then
+                          pseudo_file=$(find "$workspace_dir" -maxdepth 1 -name "*.pseudo" -print -quit)
+                          if [ -n "$pseudo_file" ]; then
+                              pseudo_base=$(basename "$pseudo_file" .pseudo)
+                              print_name="${file_name/$project_prefix/$pseudo_base}"
+                          fi
+                      fi
+                      
+                      # Read new data using tail + head for byte offset
+                      bytes_to_read=$((current_size - last_pos))
+                      new_data=$(tail -c +$((last_pos + 1)) "$log" | head -c "$bytes_to_read")
+                      
+                      # Process line by line
+                      echo "$new_data" | while IFS= read -r line; do
+                          if [ -z "$line" ]; then continue; fi
+                          
+                          # Dynamic literal masking <MASK>...</MASK>
+                          while [[ "$line" =~ \<MASK\>(.*)\</MASK\> ]]; mask_match="${BASH_REMATCH[1]}"; do
+                              if [ -n "$mask_match" ]; then
+                                  LITERAL_MASKS["$file_name"]+="$mask_match|"
+                              fi
+                              line="${line/<MASK>${mask_match}<\/MASK>/$mask_match}"
+                          done
+                          
+                          if [ -n "${LITERAL_MASKS[$file_name]}" ]; then
+                              IFS='|' read -ra masks <<< "${LITERAL_MASKS[$file_name]}"
+                              for mask in "${masks[@]}"; do
+                                  if [ -n "$mask" ]; then
+                                      line="${line//$mask/***}"
+                                  fi
+                              done
+                          fi
+                          
+                          echo "[$print_name] $line"
+                      done
+                      
+                      LOG_POSITIONS[$file_name]=$current_size
+                  fi
+              done
+              
+              sleep 5
+          done
+
+      - name: Finalize Session Persistence & State Synchronization
+        if: always()
+        run: |
+          source /etc/environment
+          echo "=== INITIATING EMERGENCY TEARDOWN ==="
+          STATE_REPO="/opt/state-repo"
+          if [ ! -d "$STATE_REPO" ]; then exit 0; fi
+          
+          if [ ! -f "$STATE_REPO/end_run.flag" ]; then
+              echo "Broadcasting end_run.flag to workspace projects for graceful shutdown..."
+              touch "$STATE_REPO/end_run.flag"
+          fi
+          
+          echo "Waiting 30 seconds for gracefully exiting processes..."
+          sleep 30
+          
+          if [ -f "$STATE_REPO/Linux/Repository/Essentials/Force-Backup.sh" ]; then
+              echo "Executing Final Backup..."
+              sudo git config --global --add safe.directory "$STATE_REPO" || true
+              sudo -E -u "$LIN_USERNAME" env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null bash "$STATE_REPO/Linux/Repository/Essentials/Force-Backup.sh"
+          fi
+          
+          echo "Cleaning up lingering background processes..."
+          sudo pkill -u "$LIN_USERNAME" || true
+          echo "Teardown complete."
